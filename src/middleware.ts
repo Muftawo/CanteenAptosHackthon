@@ -19,16 +19,17 @@ import { paymentMiddleware } from "aptos-x402";
 import { withpay402Tracking } from "@/lib/pay402-middleware";
 
 // ─── Environment ────────────────────────────────────────────────
-const RECIPIENT = "0xaaefee8ba1e5f24ef88a74a3f445e0d2b810b90c1996466dae5ea9a0b85d42a0";
-const USDC_ASSET = "0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832";
-// const RECIPIENT = process.env.PAYMENT_RECIPIENT_ADDRESS!;
-// const USDC_ASSET = process.env.USDC_ASSET_ADDRESS!;
+// ─── Environment ────────────────────────────────────────────────
+const RECIPIENT = process.env.PAYMENT_RECIPIENT_ADDRESS!;
+const FACILITATOR_URL = process.env.FACILITATOR_URL ?? "https://x402-navy.vercel.app/facilitator";
+const DASHBOARD_ID = process.env.pay402_DASHBOARD_ID ?? "pay402_demo_001";
+const USDC_ASSET = process.env.USDC_ASSET_ADDRESS!;
 
-console.log("Middleware Init (Hardcoded):", {
-  RECIPIENT,
-  FACILITATOR_URL,
-  USDC_ASSET,
-  DASHBOARD_ID
+console.log("Middleware Init:", {
+  RECIPIENT: RECIPIENT ? "Defined" : "Missing",
+  // FACILITATOR_URL,
+  // USDC_ASSET,
+  // DASHBOARD_ID
 });
 
 const ROUTES: Record<string, { price: string; network: string; asset: string; recipient?: string }> = {
@@ -48,7 +49,7 @@ const ROUTES: Record<string, { price: string; network: string; asset: string; re
 
 // ─── Build the x402 middleware ──────────────────────────────────
 const x402 = paymentMiddleware(RECIPIENT, ROUTES, { url: FACILITATOR_URL });
-export const middleware = withpay402Tracking(x402, {
+export const middleware = withpay402Tracking(x402 as any, {
   dashboardId: DASHBOARD_ID,
 });
 
@@ -59,5 +60,5 @@ export const middleware = withpay402Tracking(x402, {
 //   • /api/events     → passes through (not in ROUTES, so x402 is a no-op)
 //   • /api/dashboard  → same pass-through
 export const config = {
-  matcher: ["/api/:path*"],
+  matcher: ["/api/premium/:path*"],
 };

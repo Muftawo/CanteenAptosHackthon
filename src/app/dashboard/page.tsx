@@ -1,8 +1,10 @@
 "use client";
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import type { DashboardSummary } from "@/types/pay402";
 
 export default function DashboardPage() {
+    const router = useRouter();
     const [data, setData] = useState<DashboardSummary | null>(null);
     const [loading, setLoading] = useState(true);
 
@@ -30,7 +32,15 @@ export default function DashboardPage() {
 
     return (
         <div className="min-h-screen bg-gray-950 text-white p-8">
-            <h1 className="text-3xl font-bold mb-6">Live Dashboard</h1>
+            <div className="flex items-center justify-between mb-6">
+                <h1 className="text-3xl font-bold">Live Dashboard</h1>
+                <button
+                    onClick={() => router.push("/")}
+                    className="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white transition-colors text-sm font-medium border border-gray-700"
+                >
+                    ← Back to Home
+                </button>
+            </div>
 
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
                 <Card title="Total Events" value={data.totalEvents} />
