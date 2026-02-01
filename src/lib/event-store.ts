@@ -15,6 +15,18 @@ import type {
 // a single serverless instance.  For production, replace with a DB.
 const events: PaymentEvent[] = [];
 
+// ─── Settings ───────────────────────────────────────────────────
+// In-memory storage for settings (webhook URL, etc.)
+let webhookUrl: string | null = null;
+
+export function setWebhookUrl(url: string | null) {
+  webhookUrl = url;
+}
+
+export function getWebhookUrl() {
+  return webhookUrl;
+}
+
 // ─── Write ──────────────────────────────────────────────────────
 
 export function recordEvent(raw: {
@@ -41,10 +53,78 @@ export function recordEvent(raw: {
     payer: raw.payer ?? null,
     failureReason,
     lifecycle: raw.lifecycle ?? [],
+    location: mockLocation(),
   };
 
   events.push(event);
+
+  // ─── Trigger Webhook ──────────────────────────────────────────
+  // If this is a failure (not 200) and a webhook URL is configured, fire it.
+  if (event.status !== 200 && webhookUrl) {
+    fireWebhook(webhookUrl, event).catch((err) => {
+      console.error("Webhook failed:", err);
+    });
+  }
+
   return event;
+}
+
+// ─── New Helpers ────────────────────────────────────────────────
+
+export function getRecentEvents(limit = 100): PaymentEvent[] {
+  return events.slice(-limit).reverse();
+}
+
+export function checkSubscription(payer: string, windowMs: number): boolean {
+  const cutoff = Date.now() - windowMs;
+  // Check if this payer has any SUCCESSFUL payment in the window
+  return events.some(
+    (e) =>
+      e.status === 200 &&
+      e.payer === payer &&
+      e.startedAt > cutoff
+  );
+}
+
+function mockLocation() {
+  // Randomly distribute across tech hubs
+  const locations = [
+    { lat: 37.7749, lng: -122.4194, country: "US" }, // SF
+    { lat: 40.7128, lng: -74.0060, country: "US" },  // NYC
+    { lat: 51.5074, lng: -0.1278, country: "UK" },   // London
+    { lat: 35.6762, lng: 139.6503, country: "JP" },  // Tokyo
+    { lat: 1.3521, lng: 103.8198, country: "SG" },   // Singapore
+    { lat: 52.5200, lng: 13.4050, country: "DE" },   // Berlin
+    { lat: 43.6532, lng: -79.3832, country: "CA" },  // Toronto
+    { lat: -33.8688, lng: 151.2093, country: "AU" }, // Sydney
+  ];
+  return locations[Math.floor(Math.random() * locations.length)];
+}
+
+async function fireWebhook(url: string, event: PaymentEvent) {
+  const payload = {
+    username: "Pay402 Alert",
+    avatar_url: "https://aptos.dev/img/aptos_logo_transparent.png",
+    embeds: [
+      {
+        title: "❌ Payment Failed",
+        color: 15158332, // Red
+        fields: [
+          { name: "Endpoint", value: `\`${event.endpoint}\``, inline: true },
+          { name: "Reason", value: `\`${event.failureReason}\``, inline: true },
+          { name: "Status", value: `${event.status}`, inline: true },
+          { name: "Payer", value: event.payer ? `\`${event.payer.slice(0, 8)}...\`` : "Unknown" },
+        ],
+        timestamp: new Date(event.startedAt).toISOString(),
+      },
+    ],
+  };
+
+  await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 // ─── Read ───────────────────────────────────────────────────────
@@ -75,6 +155,10 @@ export function getDashboardSummary(dashboardId: string): DashboardSummary {
       avgLatencyMs: 0,
       endpoints: [],
       revenueTimeSeries: [],
+      recentEvents: [],
+      topWallets: [],
+      hourlyInsights: [],
+      failureBreakdown: [],
     };
   }
 
@@ -128,7 +212,66 @@ export function getDashboardSummary(dashboardId: string): DashboardSummary {
     avgLatencyMs: avgLatency,
     endpoints: Array.from(endpointMap.values()),
     revenueTimeSeries,
+    recentEvents: getRecentEvents(50),
+    topWallets: computeTopWallets(successful),
+    hourlyInsights: computeHourlyInsights(scoped),
+    failureBreakdown: computeFailureBreakdown(scoped),
   };
+}
+
+// ─── Analytics Helpers ──────────────────────────────────────────
+
+function computeTopWallets(events: PaymentEvent[]) {
+  const map = new Map<string, { totalSpent: number; txCount: number; lastSeen: number }>();
+
+  for (const e of events) {
+    if (!e.payer) continue;
+    const existing = map.get(e.payer) ?? { totalSpent: 0, txCount: 0, lastSeen: 0 };
+    existing.totalSpent += e.amountUSDC;
+    existing.txCount++;
+    existing.lastSeen = Math.max(existing.lastSeen, e.startedAt);
+    map.set(e.payer, existing);
+  }
+
+  return Array.from(map.entries())
+    .map(([address, data]) => ({ address, ...data }))
+    .sort((a, b) => b.totalSpent - a.totalSpent)
+    .slice(0, 10);
+}
+
+function computeHourlyInsights(events: PaymentEvent[]) {
+  const map = new Map<number, { success: number; total: number }>();
+
+  for (const e of events) {
+    const hour = new Date(e.startedAt).getHours();
+    const existing = map.get(hour) ?? { success: 0, total: 0 };
+    existing.total++;
+    if (e.status === 200) existing.success++;
+    map.set(hour, existing);
+  }
+
+  // Ensure all 24 hours are present? Maybe just active ones for now.
+  return Array.from(map.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([hour, data]) => ({
+      hour: `${hour}:00`,
+      successRate: data.total > 0 ? data.success / data.total : 0,
+      transactionCount: data.total
+    }));
+}
+
+function computeFailureBreakdown(events: PaymentEvent[]) {
+  const failed = events.filter(e => e.status !== 200);
+  const map = new Map<string, number>();
+
+  for (const e of failed) {
+    const reason = e.failureReason || "unknown";
+    map.set(reason, (map.get(reason) ?? 0) + 1);
+  }
+
+  return Array.from(map.entries())
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
