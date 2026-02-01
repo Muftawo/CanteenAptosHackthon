@@ -18,8 +18,12 @@
 //     latency to the critical payment path.
 //   • txHash is read from the PAYMENT-RESPONSE header that the
 //     facilitator attaches on successful settlement (see cheatsheet).
+//   • REAL-TIME LIFECYCLE: We monkey-patch globalThis.fetch during the
+//     execution of the x402 middleware to capture the exact timing of
+//     calls to the facilitator (/verify and /settle).
 
 import { type NextRequest, type NextResponse } from "next/server";
+import type { LifecycleEvent, LifecycleStage } from "@/types/pay402";
 
 interface pay402TrackingConfig {
   dashboardId: string;
@@ -35,16 +39,67 @@ export function withpay402Tracking(
 ): X402Middleware {
   return async (req: NextRequest): Promise<NextResponse> => {
     const startedAt = Date.now();
+    const lifecycle: LifecycleEvent[] = [];
 
-    // ── Call the real x402 middleware (unmodified) ──
-    const response = await x402Middleware(req);
+    // 1. Initial event: request arrives at server
+    lifecycle.push({
+      stage: "request_received",
+      timestampMs: startedAt,
+      durationMs: 0,
+    });
 
-    const durationMs = Date.now() - startedAt;
+    // 2. Monkey-patch fetch to intercept facilitator calls
+    // This allows us to measure "facilitator_verify" and "facilitator_settle"
+    // perfectly without modifying the underlying SDK.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const startMs = Date.now();
+      const url = String(input);
+      let stage: LifecycleStage | null = null;
+
+      if (url.includes("/verify")) stage = "facilitator_verify";
+      else if (url.includes("/settle")) stage = "facilitator_settle";
+
+      try {
+        const res = await originalFetch(input, init);
+        if (stage) {
+          const durationMs = Date.now() - startMs;
+          lifecycle.push({
+            stage,
+            timestampMs: startMs,
+            durationMs,
+            meta: { status: res.status }
+          });
+        }
+        return res;
+      } catch (err) {
+        if (stage) {
+          const durationMs = Date.now() - startMs;
+          lifecycle.push({
+            stage,
+            timestampMs: startMs,
+            durationMs,
+            meta: { error: String(err) }
+          });
+        }
+        throw err;
+      }
+    };
+
+    // 3. Run the real middleware (now instrumented via fetch)
+    let response: NextResponse;
+    try {
+      response = await x402Middleware(req);
+    } finally {
+      // ALWAYS restore fetch, even if middleware crashes
+      globalThis.fetch = originalFetch;
+    }
+
+    const completedAt = Date.now();
+    const durationMs = completedAt - startedAt;
     const status = response.status as 200 | 402 | 403;
 
-    // ── Extract settlement info from response headers ──
-    // On 200, the facilitator attaches PAYMENT-RESPONSE (base64 JSON).
-    // We only need the txHash from it; everything else stays opaque.
+    // 4. Extract settlement info if successful
     let txHash: string | null = null;
     let payer: string | null = null;
 
@@ -58,20 +113,49 @@ export function withpay402Tracking(
           txHash = decoded.txHash ?? decoded.transaction?.hash ?? null;
           payer = decoded.payer ?? decoded.sender ?? null;
         } catch {
-          // Silently ignore malformed headers — never crash the payment flow
+          // Silently ignore malformed headers
         }
       }
     }
 
-    // ── Build lifecycle stages we can infer from timing ──
-    // We know the total duration and the status.  Fine-grained stage
-    // timings (verify vs settle) require hooking into the facilitator
-    // calls themselves — out of scope for the wrapper.  We approximate
-    // the dominant stages here for the inspector view.
-    const lifecycle = buildApproximateLifecycle(status, startedAt, durationMs);
+    // 5. Fill in the gaps in the lifecycle
+    if (status === 402) {
+      // Immediate rejection (no payment provided)
+      lifecycle.push({
+        stage: "402_issued",
+        timestampMs: completedAt,
+        durationMs: 0
+      });
+    } else {
+      // Status 200 or 403 means we attempted verification.
+      // Therefore, a payment was provided (signed by client).
+      // We record "payment_signed" as having happened just before/at the start.
+      lifecycle.push({
+        stage: "payment_signed",
+        timestampMs: startedAt,
+        durationMs: 0
+      });
 
-    // ── Fire-and-forget: POST to our own ingest endpoint ──
-    // Uses the request's origin so it works on localhost AND Vercel.
+      // If successful, we consider it "settled" now
+      if (status === 200) {
+        lifecycle.push({
+          stage: "settled",
+          timestampMs: completedAt,
+          durationMs: 0
+        });
+      }
+
+      lifecycle.push({
+        stage: "response_sent",
+        timestampMs: completedAt,
+        durationMs: 0
+      });
+    }
+
+    // Sort events chronologically to be sure
+    lifecycle.sort((a, b) => a.timestampMs - b.timestampMs);
+
+    // 6. Fire-and-forget: POST to our ingest endpoint
     const origin = req.nextUrl.origin;
     const ingestUrl = config.ingestUrl ?? `${origin}/api/events`;
 
@@ -87,7 +171,6 @@ export function withpay402Tracking(
       // Swallow errors — analytics must never break payments
     });
 
-    // ── Return the original response completely untouched ──
     return response;
   };
 }
@@ -100,43 +183,4 @@ async function emitEvent(url: string, body: unknown): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-}
-
-function buildApproximateLifecycle(
-  status: 200 | 402 | 403,
-  startedAt: number,
-  totalMs: number
-) {
-  const stages: Array<{ stage: string; timestampMs: number; durationMs: number }> = [];
-
-  // Every request starts with the initial hit
-  stages.push({ stage: "request_received", timestampMs: startedAt, durationMs: 1 });
-
-  if (status === 402) {
-    // No payment was provided — the middleware returned 402 immediately.
-    // The only meaningful latency is the middleware's own check (~1 ms).
-    stages.push({ stage: "402_issued", timestampMs: startedAt + 1, durationMs: totalMs - 1 });
-    return stages;
-  }
-
-  // For 200 or 403, the client DID send a payment signature.
-  // Approximate the breakdown: verify ~40%, settle ~40%, overhead ~20%
-  const verifyMs = Math.round(totalMs * 0.4);
-  const settleMs = Math.round(totalMs * 0.4);
-  const overheadMs = totalMs - verifyMs - settleMs;
-
-  stages.push({ stage: "payment_signed", timestampMs: startedAt + overheadMs, durationMs: overheadMs });
-  stages.push({ stage: "facilitator_verify", timestampMs: startedAt + overheadMs, durationMs: verifyMs });
-
-  if (status === 403) {
-    // Verification failed — no settlement attempted
-    return stages;
-  }
-
-  // status === 200: verify passed, then settle
-  stages.push({ stage: "facilitator_settle", timestampMs: startedAt + overheadMs + verifyMs, durationMs: settleMs });
-  stages.push({ stage: "settled", timestampMs: startedAt + overheadMs + verifyMs + settleMs, durationMs: 0 });
-  stages.push({ stage: "response_sent", timestampMs: startedAt + totalMs, durationMs: 0 });
-
-  return stages;
 }
