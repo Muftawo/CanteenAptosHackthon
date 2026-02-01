@@ -42,6 +42,7 @@ export interface PaymentEvent {
   payer: string | null;                // buyer wallet address (extracted from tx)
   failureReason: FailureReason | null; // populated only when status !== 200
   lifecycle: LifecycleEvent[];         // ordered stage timestamps
+  location?: { lat: number; lng: number; country: string }; // Mocked GeoIP data
 }
 
 /** One timestamped stage inside a transaction */
@@ -78,4 +79,8 @@ export interface DashboardSummary {
   avgLatencyMs: number;
   endpoints: EndpointSummary[];
   revenueTimeSeries: RevenueDataPoint[];
+  recentEvents: PaymentEvent[]; // New field for live feeds
+  topWallets: { address: string; totalSpent: number; txCount: number; lastSeen: number }[];
+  hourlyInsights: { hour: string; successRate: number; transactionCount: number }[];
+  failureBreakdown: { reason: string; count: number }[];
 }
